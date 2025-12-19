@@ -1,0 +1,4 @@
+/usr/bin/cmake -DCMAKE_BUILD_TYPE=Debug -G "Unix Makefiles" -S "/mnt/c/Users/dymas/Desktop/Uni/RN_VS/RN-Praxis/Praxis 2 Norm/praxis2" -B "/mnt/c/Users/dymas/Desktop/Uni/RN_VS/RN-Praxis/Praxis 2 Norm/praxis2/cmake-build-debug"
+-- Configuring done (3.3s)
+-- Generating done (0.8s)
+-- Build files have been written to: /mnt/c/Users/dymas/Desktop/Uni/RN_VS/RN-Praxis/Praxis 2 Norm/praxis2/cmake-build-debug
