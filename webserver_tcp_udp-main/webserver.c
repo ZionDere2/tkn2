@@ -7,6 +7,7 @@
 #include <poll.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/types.h>
@@ -18,10 +19,28 @@
 
 #define MAX_RESOURCES 100
 
+struct node_info {
+    uint16_t id;
+    char ip[INET_ADDRSTRLEN];
+    uint16_t port;
+};
+
+static struct node_info self_info = {0};
+static struct node_info pred_info = {0};
+static struct node_info succ_info = {0};
+static bool dht_enabled = false;
+
 struct tuple resources[MAX_RESOURCES] = {
-    {"/static/foo", "Foo", sizeof "Foo" - 1},
-    {"/static/bar", "Bar", sizeof "Bar" - 1},
-    {"/static/baz", "Baz", sizeof "Baz" - 1}};
+        {"/static/foo", "Foo", sizeof "Foo" - 1},
+        {"/static/bar", "Bar", sizeof "Bar" - 1},
+        {"/static/baz", "Baz", sizeof "Baz" - 1}};
+
+static bool is_responsible(uint16_t hash) {
+    if (pred_info.id < self_info.id) {
+        return hash > pred_info.id && hash <= self_info.id;
+    }
+    return hash > pred_info.id || hash <= self_info.id;
+}
 
 /**
  * Sends an HTTP reply to the client based on the received request.
@@ -37,19 +56,28 @@ void send_reply(int conn, struct request *request) {
     char *reply = buffer;
     size_t offset = 0;
 
+    uint16_t hash =
+            pseudo_hash((const unsigned char *)request->uri, strlen(request->uri));
+
     fprintf(stderr, "Handling %s request for %s (%lu byte payload)\n",
             request->method, request->uri, request->payload_length);
 
-    if (strcmp(request->method, "GET") == 0) {
+    if (dht_enabled && !is_responsible(hash)) {
+        offset = sprintf(buffer,
+                         "HTTP/1.1 303 See Other\r\nLocation: http://%s:%u%s\r\n"
+                         "Content-Length: 0\r\n\r\n",
+                         succ_info.ip, succ_info.port, request->uri);
+        reply = buffer;
+    } else if (strcmp(request->method, "GET") == 0) {
         // Find the resource with the given URI in the 'resources' array.
         size_t resource_length;
         const char *resource =
-            get(request->uri, resources, MAX_RESOURCES, &resource_length);
+                get(request->uri, resources, MAX_RESOURCES, &resource_length);
 
         if (resource) {
             size_t payload_offset =
-                sprintf(reply, "HTTP/1.1 200 OK\r\nContent-Length: %lu\r\n\r\n",
-                        resource_length);
+                    sprintf(reply, "HTTP/1.1 200 OK\r\nContent-Length: %lu\r\n\r\n",
+                            resource_length);
             memcpy(reply + payload_offset, resource, resource_length);
             offset = payload_offset + resource_length;
         } else {
@@ -101,7 +129,7 @@ void send_reply(int conn, struct request *request) {
  */
 ssize_t process_packet(int conn, char *buffer, size_t n) {
     struct request request = {
-        .method = NULL, .uri = NULL, .payload = NULL, .payload_length = -1};
+            .method = NULL, .uri = NULL, .payload = NULL, .payload_length = -1};
     ssize_t bytes_processed = parse_request(buffer, n, &request);
 
     if (bytes_processed > 0) {
@@ -179,7 +207,7 @@ bool handle_connection(struct connection_state *state) {
 
     // Check if an error occurred while receiving data from the socket
     ssize_t bytes_read =
-        recv(state->sock, state->end, buffer_end - state->end, 0);
+            recv(state->sock, state->end, buffer_end - state->end, 0);
     if (bytes_read == -1) {
         perror("recv");
         close(state->sock);
@@ -217,7 +245,7 @@ bool handle_connection(struct connection_state *state) {
  */
 static struct sockaddr_in derive_sockaddr(const char *host, const char *port) {
     struct addrinfo hints = {
-        .ai_family = AF_INET,
+            .ai_family = AF_INET,
     };
     struct addrinfo *result_info;
 
@@ -235,6 +263,44 @@ static struct sockaddr_in derive_sockaddr(const char *host, const char *port) {
     // Free the allocated memory for the result_info
     freeaddrinfo(result_info);
     return result;
+}
+
+static void initialize_nodes(const char *self_ip, const char *self_port,
+                             uint16_t self_id) {
+    strncpy(self_info.ip, self_ip, INET_ADDRSTRLEN);
+    self_info.ip[INET_ADDRSTRLEN - 1] = '\0';
+    self_info.port = safe_strtoul(self_port, NULL, 10, "invalid self port");
+    self_info.id = self_id;
+
+    const char *pred_id_env = getenv("PRED_ID");
+    const char *pred_ip_env = getenv("PRED_IP");
+    const char *pred_port_env = getenv("PRED_PORT");
+
+    const char *succ_id_env = getenv("SUCC_ID");
+    const char *succ_ip_env = getenv("SUCC_IP");
+    const char *succ_port_env = getenv("SUCC_PORT");
+
+    if (!pred_id_env || !pred_ip_env || !pred_port_env || !succ_id_env ||
+        !succ_ip_env || !succ_port_env) {
+        dht_enabled = false;
+        pred_info = self_info;
+        succ_info = self_info;
+        return;
+    }
+
+    dht_enabled = true;
+
+    pred_info.id = safe_strtoul(pred_id_env, NULL, 10, "invalid predecessor id");
+    strncpy(pred_info.ip, pred_ip_env, INET_ADDRSTRLEN);
+    pred_info.ip[INET_ADDRSTRLEN - 1] = '\0';
+    pred_info.port =
+            safe_strtoul(pred_port_env, NULL, 10, "invalid predecessor port");
+
+    succ_info.id = safe_strtoul(succ_id_env, NULL, 10, "invalid successor id");
+    strncpy(succ_info.ip, succ_ip_env, INET_ADDRSTRLEN);
+    succ_info.ip[INET_ADDRSTRLEN - 1] = '\0';
+    succ_info.port =
+            safe_strtoul(succ_port_env, NULL, 10, "invalid successor port");
 }
 
 /**
@@ -274,7 +340,7 @@ static int setup_server_socket(struct sockaddr_in addr) {
     if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) == -1) {
         perror("bind");
         close(sock);
-        exit(EXIT_FAILURE);
+        return -1;
     }
 
     // Start listening on the socket with maximum backlog of 1 pending
@@ -286,9 +352,10 @@ static int setup_server_socket(struct sockaddr_in addr) {
 
     return sock;
 }
+
 static int setup_udp_server_socket(struct sockaddr_in addr) {
     const int enable = 1;
-   // const int backlog = 1;
+    // const int backlog = 1;
 
     // Create a socket
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
@@ -309,13 +376,13 @@ static int setup_udp_server_socket(struct sockaddr_in addr) {
         -1) {
         perror("setsockopt");
         exit(EXIT_FAILURE);
-        }
+    }
 
     // Bind socket to the provided address
     if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) == -1) {
         perror("bind");
         close(sock);
-        exit(EXIT_FAILURE);
+        return -1;
     }
 
     // Start listening on the socket with maximum backlog of 1 pending
@@ -330,29 +397,43 @@ static int setup_udp_server_socket(struct sockaddr_in addr) {
 
 
 /**
- *  The program expects 3; otherwise, it returns EXIT_FAILURE.
+ *  The program expects at least 3 and at most 4 parameters; otherwise, it
+ *  returns EXIT_FAILURE.
  *
  *  Call as:
  *
  *  ./build/webserver self.ip self.port
  */
 int main(int argc, char **argv) {
-    if (argc != 3) {
+    if (argc < 3 || argc > 4) {
         return EXIT_FAILURE;
+    }
+
+    uint16_t node_id = 0;
+    if (argc == 4) {
+        node_id = safe_strtoul(argv[3], NULL, 10, "invalid node id");
     }
 
     struct sockaddr_in addr = derive_sockaddr(argv[1], argv[2]);
 
+    initialize_nodes(argv[1], argv[2], node_id);
+
     // Set up a server socket.
     int server_socket = setup_server_socket(addr);
+    if (server_socket < 0) {
+        return EXIT_FAILURE;
+    }
     int server_socket_udp = setup_udp_server_socket(addr);  //Aufgabe 1.1
+    if (server_socket_udp < 0) {
+        return EXIT_FAILURE;
+    }
 
     // Erstelle ein Array von pollfd-Strukturen, um Sockets auf Ereignisse zu überwachen.
     // struct pollfd: Struktur aus <poll.h> für die poll-Funktion; enthält fd (Dateideskriptor),
     // events (gewünschte Ereignisse, z.B. POLLIN für eingehende Daten) und revents (tatsächliche Ereignisse).
     struct pollfd sockets[2] = {
-        {.fd = server_socket, .events = POLLIN},        // Überwache TCP-Server-Socket auf eingehende Verbindungen
-        {.fd = server_socket_udp, .events = POLLIN}     // Überwache UDP-Server-Socket auf eingehende Datagramme (Aufgabe 1.1)
+            {.fd = server_socket, .events = POLLIN},        // Überwache TCP-Server-Socket auf eingehende Verbindungen
+            {.fd = server_socket_udp, .events = POLLIN}     // Überwache UDP-Server-Socket auf eingehende Datagramme (Aufgabe 1.1)
     };
 
 
@@ -360,10 +441,10 @@ int main(int argc, char **argv) {
     while (true) {
 
         // Use poll() to wait for events on the monitored sockets.
-        /*Die poll-Funktion wartet hier auf Ereignisse (z. B. eingehende Daten oder Verbindungen) auf den 
-        überwachten Sockets (sockets-Array), ohne den Prozess zu blockieren. 
+        /*Die poll-Funktion wartet hier auf Ereignisse (z. B. eingehende Daten oder Verbindungen) auf den
+        überwachten Sockets (sockets-Array), ohne den Prozess zu blockieren.
         Sie gibt die Anzahl der bereitstehenden Sockets zurück (ready),
-         damit der Server effizient auf TCP-Verbindungen, UDP-Datagramme oder Client-Daten 
+         damit der Server effizient auf TCP-Verbindungen, UDP-Datagramme oder Client-Daten
          reagieren kann, anstatt ständig zu prüfen. Der Timeout -1 bedeutet unbegrenztes Warten */
         int ready = poll(sockets, sizeof(sockets) / sizeof(sockets[0]), -1);
         if (ready == -1) {
@@ -372,8 +453,8 @@ int main(int argc, char **argv) {
         }
 
         // Process events on the monitored sockets.
-        //  in der for-Schleife wird jedes Socket individuell über sockets[i].revents geprüft, ob ein POLLIN-Ereignis vorliegt. 
-        
+        //  in der for-Schleife wird jedes Socket individuell über sockets[i].revents geprüft, ob ein POLLIN-Ereignis vorliegt.
+
         for (size_t i = 0; i < sizeof(sockets) / sizeof(sockets[0]); i += 1) {
             if (sockets[i].revents != POLLIN) {
                 // If there are no POLLIN events on the socket, continue to the
