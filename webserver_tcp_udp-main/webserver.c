@@ -7,6 +7,7 @@
 #include <poll.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/types.h>
@@ -18,10 +19,27 @@
 
 #define MAX_RESOURCES 100
 
+struct node_info {
+    uint16_t id;
+    char ip[INET_ADDRSTRLEN];
+    uint16_t port;
+};
+
+static struct node_info self_info = {0};
+static struct node_info pred_info = {0};
+static struct node_info succ_info = {0};
+
 struct tuple resources[MAX_RESOURCES] = {
     {"/static/foo", "Foo", sizeof "Foo" - 1},
     {"/static/bar", "Bar", sizeof "Bar" - 1},
     {"/static/baz", "Baz", sizeof "Baz" - 1}};
+
+static bool is_responsible(uint16_t hash) {
+    if (pred_info.id < self_info.id) {
+        return hash > pred_info.id && hash <= self_info.id;
+    }
+    return hash > pred_info.id || hash <= self_info.id;
+}
 
 /**
  * Sends an HTTP reply to the client based on the received request.
@@ -37,10 +55,19 @@ void send_reply(int conn, struct request *request) {
     char *reply = buffer;
     size_t offset = 0;
 
+    uint16_t hash =
+        pseudo_hash((const unsigned char *)request->uri, strlen(request->uri));
+
     fprintf(stderr, "Handling %s request for %s (%lu byte payload)\n",
             request->method, request->uri, request->payload_length);
 
-    if (strcmp(request->method, "GET") == 0) {
+    if (!is_responsible(hash)) {
+        offset = sprintf(buffer,
+                         "HTTP/1.1 303 See Other\r\nLocation: http://%s:%u%s\r\n"
+                         "Content-Length: 0\r\n\r\n",
+                         succ_info.ip, succ_info.port, request->uri);
+        reply = buffer;
+    } else if (strcmp(request->method, "GET") == 0) {
         // Find the resource with the given URI in the 'resources' array.
         size_t resource_length;
         const char *resource =
@@ -237,6 +264,40 @@ static struct sockaddr_in derive_sockaddr(const char *host, const char *port) {
     return result;
 }
 
+static void initialize_nodes(const char *self_ip, const char *self_port,
+                             uint16_t self_id) {
+    strncpy(self_info.ip, self_ip, INET_ADDRSTRLEN);
+    self_info.ip[INET_ADDRSTRLEN - 1] = '\0';
+    self_info.port = safe_strtoul(self_port, NULL, 10, "invalid self port");
+    self_info.id = self_id;
+
+    const char *pred_id_env = getenv("PRED_ID");
+    const char *pred_ip_env = getenv("PRED_IP");
+    const char *pred_port_env = getenv("PRED_PORT");
+
+    const char *succ_id_env = getenv("SUCC_ID");
+    const char *succ_ip_env = getenv("SUCC_IP");
+    const char *succ_port_env = getenv("SUCC_PORT");
+
+    if (!pred_id_env || !pred_ip_env || !pred_port_env || !succ_id_env ||
+        !succ_ip_env || !succ_port_env) {
+        fprintf(stderr, "Missing neighborhood configuration\n");
+        exit(EXIT_FAILURE);
+    }
+
+    pred_info.id = safe_strtoul(pred_id_env, NULL, 10, "invalid predecessor id");
+    strncpy(pred_info.ip, pred_ip_env, INET_ADDRSTRLEN);
+    pred_info.ip[INET_ADDRSTRLEN - 1] = '\0';
+    pred_info.port =
+        safe_strtoul(pred_port_env, NULL, 10, "invalid predecessor port");
+
+    succ_info.id = safe_strtoul(succ_id_env, NULL, 10, "invalid successor id");
+    strncpy(succ_info.ip, succ_ip_env, INET_ADDRSTRLEN);
+    succ_info.ip[INET_ADDRSTRLEN - 1] = '\0';
+    succ_info.port =
+        safe_strtoul(succ_port_env, NULL, 10, "invalid successor port");
+}
+
 /**
  * Sets up a TCP server socket and binds it to the provided sockaddr_in address.
  *
@@ -330,18 +391,26 @@ static int setup_udp_server_socket(struct sockaddr_in addr) {
 
 
 /**
- *  The program expects 3; otherwise, it returns EXIT_FAILURE.
+ *  The program expects at least 3 and at most 4 parameters; otherwise, it
+ *  returns EXIT_FAILURE.
  *
  *  Call as:
  *
  *  ./build/webserver self.ip self.port
  */
 int main(int argc, char **argv) {
-    if (argc != 3) {
+    if (argc < 3 || argc > 4) {
         return EXIT_FAILURE;
     }
 
+    uint16_t node_id = 0;
+    if (argc == 4) {
+        node_id = safe_strtoul(argv[3], NULL, 10, "invalid node id");
+    }
+
     struct sockaddr_in addr = derive_sockaddr(argv[1], argv[2]);
+
+    initialize_nodes(argv[1], argv[2], node_id);
 
     // Set up a server socket.
     int server_socket = setup_server_socket(addr);
