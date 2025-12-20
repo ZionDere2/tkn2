@@ -28,6 +28,7 @@ struct node_info {
 static struct node_info self_info = {0};
 static struct node_info pred_info = {0};
 static struct node_info succ_info = {0};
+static int udp_socket_fd = -1;
 
 struct tuple resources[MAX_RESOURCES] = {
     {"/static/foo", "Foo", sizeof "Foo" - 1},
@@ -39,6 +40,41 @@ static bool is_responsible(uint16_t hash) {
         return hash > pred_info.id && hash <= self_info.id;
     }
     return hash > pred_info.id || hash <= self_info.id;
+}
+
+static bool successor_responsible(uint16_t hash) {
+    if (self_info.id < succ_info.id) {
+        return hash > self_info.id && hash <= succ_info.id;
+    }
+    return hash > self_info.id || hash <= succ_info.id;
+}
+
+static void send_lookup(uint16_t hash) {
+    uint8_t buffer[11];
+    struct in_addr addr;
+
+    if (inet_pton(AF_INET, self_info.ip, &addr) != 1) {
+        perror("inet_pton");
+        return;
+    }
+
+    buffer[0] = 0; // lookup flag
+    *(uint16_t *)(buffer + 1) = htons(hash);
+    *(uint16_t *)(buffer + 3) = htons(self_info.id);
+    memcpy(buffer + 5, &addr.s_addr, sizeof(addr.s_addr));
+    *(uint16_t *)(buffer + 9) = htons(self_info.port);
+
+    struct sockaddr_in succ_addr = {
+        .sin_family = AF_INET,
+        .sin_port = htons(succ_info.port),
+    };
+    if (inet_pton(AF_INET, succ_info.ip, &succ_addr.sin_addr) != 1) {
+        perror("inet_pton");
+        return;
+    }
+
+    sendto(udp_socket_fd, buffer, sizeof(buffer), 0,
+           (struct sockaddr *)&succ_addr, sizeof(succ_addr));
 }
 
 /**
@@ -62,11 +98,20 @@ void send_reply(int conn, struct request *request) {
             request->method, request->uri, request->payload_length);
 
     if (!is_responsible(hash)) {
-        offset = sprintf(buffer,
-                         "HTTP/1.1 303 See Other\r\nLocation: http://%s:%u%s\r\n"
-                         "Content-Length: 0\r\n\r\n",
-                         succ_info.ip, succ_info.port, request->uri);
-        reply = buffer;
+        if (successor_responsible(hash) || pred_info.id == succ_info.id) {
+            offset = sprintf(
+                buffer,
+                "HTTP/1.1 303 See Other\r\nLocation: http://%s:%u%s\r\n"
+                "Content-Length: 0\r\n\r\n",
+                succ_info.ip, succ_info.port, request->uri);
+            reply = buffer;
+        } else {
+            send_lookup(hash);
+            reply =
+                "HTTP/1.1 503 Service Unavailable\r\nRetry-After: 1\r\nContent-"
+                "Length: 0\r\n\r\n";
+            offset = strlen(reply);
+        }
     } else if (strcmp(request->method, "GET") == 0) {
         // Find the resource with the given URI in the 'resources' array.
         size_t resource_length;
@@ -415,6 +460,7 @@ int main(int argc, char **argv) {
     // Set up a server socket.
     int server_socket = setup_server_socket(addr);
     int server_socket_udp = setup_udp_server_socket(addr);  //Aufgabe 1.1
+    udp_socket_fd = server_socket_udp;
 
     // Erstelle ein Array von pollfd-Strukturen, um Sockets auf Ereignisse zu überwachen.
     // struct pollfd: Struktur aus <poll.h> für die poll-Funktion; enthält fd (Dateideskriptor),
